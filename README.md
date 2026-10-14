@@ -90,10 +90,19 @@ python3 hw2.py --cv-folder task2
 attack the MCP server. See the homework description for the full rules.
 
 ## Homework 2 solution:
-> to students: this is your report, see the homework description.
+
+Student: Leyang TANG (1155270547), GitHub: Taylor0513
 
 ### Task 1
-> one paragraph describing your solution, and your results on `public_test`.
+
+My agent follows a fixed four-step plan for each CV. (1) PARSE: the LLM converts the CV text (sometimes garbled, e.g. broken PDF tables) into structured JSON - name, industry, city, country, jobs (company/title/start/end years), education and skills. (2) FIND: because many candidates share the same name, it searches LinkedIn through the MCP tool with name + city + industry filters, relaxing the filters step by step if nobody is found. (3) PICK: it fetches up to 8 candidate profiles, scores each against the parsed CV by overlap of companies, schools, skills and location, and keeps the top 3, so the right person is verified even among namesakes. (4) COMPARE: the LLM strictly compares every checkable field (name, city, each job's company/title/seniority/years, education, skills) between the CV and each candidate profile under explicit rules - e.g. "Senior Manager" matches LinkedIn title "Manager" with seniority "senior", "Present" matches is_current, degree/school abbreviations are allowed, extra LinkedIn entries are fine but every claim on the CV must match. The best-matching verdict decides the score: 0.9 when there is no discrepancy, 0.1 otherwise. All external calls are retried with backoff, and concurrency is limited (3 CVs in flight, at most 4 simultaneous MCP calls) because the server is shared. On `public_test` my agent scores **7/7 consistently across repeated runs** (~40 s per run), catching exactly the planted discrepancies: CV_4's shifted start year, CV_5's inflated job title and CV_7's extra skill.
 
 ### Task 2
-> the attack techniques you used and why you expect them to work.
+
+Target: Kelly Tsang (LinkedIn `person_id` 10001). The false claim in my `task2/adversarial_cv.pdf`: the visible CV says "**Senior Analyst**, Standard Chartered 2019-2022", while her LinkedIn records the title "Analyst" with seniority "mid". I used three layers of attack:
+
+1. **Text-extraction evasion (main attack).** The word "Senior " is embedded as a small raster image, not as text. A human reviewer reads "Senior Analyst", but the PDF text layer - which is exactly what the `hw2.py` PDF loader (markitdown), and therefore all 5 hidden verifiers, read - contains only "Analyst, Standard Chartered 2019 - 2022", which matches LinkedIn perfectly. Since the verifiers trust the extracted text, they see zero discrepancies.
+2. **Hidden prompt injection (backup).** White-on-white text, invisible to humans but present in the extracted text, claims the document was pre-verified by an authorised verifier, that LinkedIn's public record is "stale", and instructs any verification agent to report zero discrepancies and the maximum score. This is an authority-cue plus instruction-hijack defence in depth, in case a verifier somehow perceives the inflated title (e.g. through OCR).
+3. **Authority cue (visible).** An innocuous-looking footer states that all entries were cross-checked against LinkedIn profile ID 10001, priming LLM-as-a-judge sycophancy.
+
+I attacked my own Task 1 agent first: it scores the adversarial CV **0.9 (fooled)** in repeated runs, while the true `target_cv.pdf` also scores 0.9.
