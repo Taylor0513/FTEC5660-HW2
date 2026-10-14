@@ -68,46 +68,192 @@ async def load_mcp_tools() -> list[Any]:
     return await client.get_tools()
 
 
+# ---------------------------------------------------------------------------
+# Our solution: a planned verification agent.
+#
+# For every CV the agent follows a fixed plan:
+#   1. PARSE    - the LLM converts the (possibly garbled) CV text into
+#                 structured JSON (name / city / jobs / education / skills).
+#   2. FIND     - search LinkedIn via MCP with name + city + industry filters
+#                 (many candidates share the same name), relaxing the filters
+#                 step by step if nobody is found.
+#   3. PICK     - fetch the candidate profiles, score them against the CV
+#                 (companies / school / skills / location overlap) and keep
+#                 the top 3 - this handles people with identical names.
+#   4. COMPARE  - the LLM strictly compares every checkable field between the
+#                 CV and each candidate profile; the best-matching verdict
+#                 wins. Any discrepancy (wrong year, wrong title/seniority,
+#                 extra skill, ...) means the CV is unreliable.
+# ---------------------------------------------------------------------------
+
+EXTRACT_SYS = """You parse a resume (CV) into structured JSON. The text comes from a PDF and may be garbled (broken tables, scrambled columns) - reconstruct it sensibly.
+
+Output ONLY a JSON object (no markdown fence):
+{
+ "name": string,
+ "industry": string,   // from the headline like "Logistics Professional" -> "Logistics"
+ "city": string,       // current city only
+ "country": string,
+ "jobs": [ {"company": string, "title": string, "start_year": int, "end_year": int|null} ],  // null if "Present"/current; keep title exactly as written incl. Senior/Junior
+ "education": [ {"degree": string, "field": string, "school": string, "grad_year": int} ],
+ "skills": [string]
+}"""
+
+COMPARE_SYS = """You are a strict CV verifier. The LinkedIn profile is the primary source of truth.
+
+Check ONLY these fields:
+1. name
+2. current city and country (ignore hometown)
+3. every job listed on the CV: company, title, seniority, start year, end year
+4. education: degree, school, field, graduation year
+5. skills: every skill on the CV must appear in the LinkedIn skills list
+
+Rules:
+- LinkedIn stores "title" and "seniority" separately: a CV title "Senior Manager" matches LinkedIn title "Manager" with seniority "senior". An explicit Senior/Junior prefix on the CV that contradicts LinkedIn seniority IS a discrepancy (e.g. CV "Senior Analyst" vs LinkedIn title "Analyst" seniority "junior").
+- "Present"/current on the CV matches is_current=true (end_year null). Otherwise start and end years must match exactly.
+- Degree/school names may be abbreviated (MBA = Master of Business Administration, BSc = Bachelor of Science, MSc = Master of Science, PhD = Doctor of Philosophy). Graduation year must match the LinkedIn education end_year.
+- Skill names may differ slightly in wording ("UI/UX Design" vs "UI/UX", "ML" vs "Machine Learning"); flag a skill only when it is clearly a DIFFERENT skill, absent in substance.
+- Items on LinkedIn but missing from the CV are NOT discrepancies. But every job, education entry, and skill ON THE CV must match LinkedIn exactly.
+- Ignore bullet descriptions, summary, status, years_experience, proficiency, and education start years.
+
+Output ONLY JSON (no fence): {"discrepancies": ["short description", ...]}
+Empty list if everything matches."""
+
+
+def _parse_json(text: str) -> Any:
+    """Extract the first JSON object from an LLM reply."""
+    match = re.search(r"\{.*\}", text, re.S)
+    return json.loads(match.group(0)) if match else None
+
+
+def _norm(value: Any) -> str:
+    """Lowercase alphanumeric normalisation for loose comparisons."""
+    return re.sub(r"[^a-z0-9 ]", "", str(value).lower()).strip()
+
+
+async def _with_retry(factory, tries: int = 5, base_delay: float = 2.0):
+    """Run an async call with linear-backoff retries (MCP/API calls can fail)."""
+    last = None
+    for attempt in range(tries):
+        try:
+            return await factory()
+        except Exception as exc:  # noqa: BLE001 - we retry any transient failure
+            last = exc
+            await asyncio.sleep(base_delay * (attempt + 1))
+    raise last
+
+
+def _match_score(info: dict, profile: dict) -> int:
+    """Heuristic score: how well does a LinkedIn profile fit the parsed CV?"""
+    score = 0
+    if _norm(info.get("city")) == _norm(profile.get("city")):
+        score += 3
+    if _norm(info.get("country")) == _norm(profile.get("country")):
+        score += 2
+    if _norm(info.get("industry")) and _norm(info.get("industry")) in _norm(profile.get("industry")):
+        score += 2
+    cv_companies = {_norm(j.get("company")) for j in info.get("jobs", [])}
+    lk_companies = {_norm(e.get("company")) for e in profile.get("experience", [])}
+    score += 4 * len(cv_companies & lk_companies)
+    cv_schools = {_norm(e.get("school")) for e in info.get("education", [])}
+    lk_schools = {_norm(e.get("school")) for e in profile.get("education", [])}
+    score += 3 * len(cv_schools & lk_schools)
+    cv_skills = {_norm(s) for s in info.get("skills", [])}
+    lk_skills = {_norm(s.get("name")) for s in profile.get("skills", [])}
+    score += len(cv_skills & lk_skills)
+    return score
+
+
 def build_agent(tools: list[Any]) -> Any:
-    """Create and return your agent once.
+    """Create the agent: one DeepSeek model plus the six SocialGraph MCP tools.
 
-    ``tools`` are the six SocialGraph MCP tools (Facebook + LinkedIn search and
-    profile lookup), already wrapped as LangChain tools. You may add your own
-    local tools as well.
-
-    Suggested imports:
-        from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
-
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env.
+    The agent is a dict holding the LLM and a name -> tool map; ``score_cvs``
+    drives it through the fixed PARSE -> FIND -> PICK -> COMPARE plan.
     """
-    ### YOUR CODE HERE
-    _ = tools
-    return None
+    from langchain_deepseek import ChatDeepSeek
+
+    llm = ChatDeepSeek(model=MODEL_NAME, temperature=0, max_tokens=4096)
+    return {"llm": llm, "tools": {t.name: t for t in tools}}
 
 
 async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
-    """Run your agent and return one reliability score per CV.
+    """Verify every CV against LinkedIn and return a reliability score each."""
+    llm = agent["llm"]
+    tool_map = agent["tools"]
+    from langchain_core.messages import HumanMessage, SystemMessage
 
-    ``cvs`` maps each file name to its text, e.g. ``{"CV_1.pdf": "...", ...}``.
-    Return a float in [0, 1] for every file name: higher means the CV is more
-    likely consistent with the candidate's LinkedIn/Facebook data. A score
-    above 0.5 counts as "valid", 0.5 or below counts as "has discrepancy".
+    cv_sem = asyncio.Semaphore(3)   # at most ~3 CVs in flight, as required
+    mcp_sem = asyncio.Semaphore(4)  # throttle raw MCP calls: the server is shared
 
-        {"CV_1.pdf": 0.9, "CV_4.pdf": 0.1, ...}
+    async def mcp_call(tool_name: str, args: dict) -> Any:
+        async with mcp_sem:
+            result = await tool_map[tool_name].ainvoke(args)
+            return json.loads(result[0]["text"])
 
-    Catch errors per CV (e.g. a failed API call) and still return a score for
-    it: an exception here means no results.csv, which scores zero.
+    async def extract_cv(text: str) -> dict:
+        reply = await llm.ainvoke([SystemMessage(content=EXTRACT_SYS), HumanMessage(content=text)])
+        info = _parse_json(reply.content)
+        if not info or "name" not in info:
+            raise ValueError("CV extraction failed")
+        return info
 
-    MCP tools are async, so call your agent with ``await agent.ainvoke(...)``.
-    You may verify CVs in parallel (e.g. ``asyncio.gather``), but keep at most
-    about 3 CVs in flight (e.g. with ``asyncio.Semaphore(3)``): the MCP server is
-    shared by the whole class.
-    """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: None for name in cvs}
+    async def search_candidates(info: dict) -> list:
+        name, city, industry = info["name"], info.get("city"), info.get("industry")
+        attempts = [
+            {"q": name, "location": city, "industry": industry},
+            {"q": name, "location": city},
+            {"q": name, "industry": industry},
+            {"q": name},
+        ]
+        for kwargs in attempts:
+            kwargs = {k: v for k, v in kwargs.items() if v}
+            found = await _with_retry(lambda k=kwargs: mcp_call("search_linkedin_people", k))
+            exact = [x for x in found if _norm(x.get("name")) == _norm(name)]
+            if exact:
+                return exact
+        return []
+
+    async def compare_with(profile: dict, text: str) -> list:
+        async def call():
+            reply = await llm.ainvoke([
+                SystemMessage(content=COMPARE_SYS),
+                HumanMessage(content=(
+                    f"CV TEXT:\n{text}\n\nLINKEDIN PROFILE JSON:\n"
+                    f"{json.dumps(profile, ensure_ascii=False)}"
+                )),
+            ])
+            verdict = _parse_json(reply.content)
+            if verdict is None or "discrepancies" not in verdict:
+                raise ValueError("unparseable verdict")
+            return verdict
+
+        verdict = await _with_retry(call)
+        return verdict["discrepancies"]
+
+    async def verify_one(name: str, text: str) -> float:
+        info = await _with_retry(lambda: extract_cv(text))
+        candidates = await search_candidates(info)
+        if not candidates:
+            return 0.1  # no such person on LinkedIn -> cannot be verified
+        profiles = await asyncio.gather(*[
+            _with_retry(lambda c=c: mcp_call("get_linkedin_profile", {"person_id": c["id"]}))
+            for c in candidates[:8]
+        ])
+        profiles = sorted(profiles, key=lambda p: _match_score(info, p), reverse=True)[:3]
+        verdicts = await asyncio.gather(*[compare_with(p, text) for p in profiles])
+        discrepancies = min(verdicts, key=len)
+        return 0.1 if discrepancies else 0.9
+
+    async def guarded(name: str, text: str) -> tuple[str, float]:
+        async with cv_sem:
+            try:
+                return name, await verify_one(name, text)
+            except Exception as exc:  # noqa: BLE001 - always return a score
+                print(f"[warn] {name}: {exc}")
+                return name, 0.5
+
+    pairs = await asyncio.gather(*[guarded(name, text) for name, text in cvs.items()])
+    return {name: score for name, score in pairs}
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
